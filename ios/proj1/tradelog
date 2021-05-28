@@ -1,0 +1,248 @@
+#!/bin/sh
+
+# tradelog(.sh) - IOS - Projekt 1
+# Matúš Remeň (xremen01)
+# 04.04.2021
+# analyzator logov z obchodovania na burze
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+print_help() {
+    echo "Tradelog - analyzator logov z obchodovania na burze
+    pouzitie:
+
+        ./tradelog.sh [-h|--help] [FILTER] [PRIKAZ] [LOG [LOG2 [...]]
+    
+    PRIKAZ moze byt jeden z:
+        list-tick   – vypis zoznamu vyskytujucich sa burzovnych symbolov, tzv. tickerov
+        
+        profit      – vypis celkoveho zisku z uzavrenych pozicii
+        
+        pos         – vypis hodnot aktualne drzanych pozicii zoradenych zostupne podla hodnoty
+        
+        last-price  – vypis poslednej znamej ceny pre kazdy ticker
+        
+        hist-ord    – vypis histogramu poctu transakcii podla tickeru
+        
+        graph-pos   – vypis grafu hodnot drzanych pozicii podla tickeru
+
+    FILTER moze byt kombinacia nasledujucich:
+        -a DATETIME – after: su uvazovane iba zaznamy PO tomto datume (bez tohoto datumu). DATETIME je formatu YYYY-MM-DD HH:MM:SS
+        
+        -b DATETIME – before: su uvazovane iba zaznamy PRED tymto datumom (bez tohoto datumu)
+        
+        -t TICKER   – su uvazovane iba zaznamy zodpovedajuce danemu tickeru
+                    – pri viacerych vyskytoch prepinaca sa bere mnozina vsetkych uvedenych tickerov
+        
+        -w WIDTH    – pri vypise grafov nastavuje ich sirku, teda dlzku najdlhsieho riadku na WIDTH
+
+    -h [--help]     – vypise napovedu s kratkym popisom kazdeho prikazu a prepinaca
+    "
+
+    return 0
+}
+
+# nacitanie vstupu a odfiltrovanie poloziek
+read_input() {
+    if [ -z "$LOGS" ] && [ -z "$GZIP_LOGS" ]; then
+        cat | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+            $2 ~ ticks { if ($1>aft && $1 <bef) print }'
+    else
+        gzip -q -d -c $GZIP_LOGS 2>/dev/null | cat $LOGS - | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+            $2 ~ ticks { if ($1>aft && $1<bef) print }'
+    fi
+   
+    return 0
+}
+
+# vypis tickerov, ktore sa vyskytuju v zaznamoch
+list_tick() {
+    echo "$INPUT" | awk -F ";" '{ print $2 }' | sort | uniq
+    return 0
+}
+
+# vypis celkoveho zisku z uzavrenych pozicii
+profit() {
+    echo "$INPUT" | awk -F ";" '$3=="sell" { sum+=$4 * $6 } $3=="buy" { sum-=$4 * $6 } END {printf "%.2f\n", sum}'
+    return 0
+}
+
+# vypis hodnot aktualne drzanych pozicii pre kazdy ticker
+pos() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t { if ($3=="sell") {sell+=$6; l=$4} else {buy+=$6; l=$4} } END {printf "%s:%.2f\n", t, (buy-sell)*l}'
+    done
+    return 0
+}
+
+# vypis poslednej znamej ceny pre kazdy ticker
+last_price() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t {last_p=$4} END {printf "%-9s : %7.2f\n", t, last_p}'
+    done
+    return 0
+}
+
+# vypis poctu transakcii pre kazdy z tickerov
+transact_counts() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t { counter++ } END {printf "%s:%.2f\n", t, counter}'
+    done
+}
+
+# vypis histogramu poctu transakcii podla tickeru
+hist_ord() {
+    COUNTS=$(transact_counts)
+    if [ $WIDTH -eq 0 ]; then
+        echo "$COUNTS" | awk -F ":" '{ if ($2 > 0) { printf "%-9s : ", $1; for(c=0;c<$2;c++) printf "#"; printf "\n"} }'
+    else
+        MAX=$(echo "$COUNTS" | sort -t: -k2 -n -r | head -n1 | awk -F ":" '{print $2}')
+        float_scale=10
+        RATIO=$(echo "scale=$float_scale; $MAX/$WIDTH" | bc)
+        echo "$COUNTS" | awk -F ":" -v ratio="$RATIO" '{ 
+            if ($2>=ratio && ratio != 0) {
+                printf "%-9s : ", $1;
+                for (c=0; c<int($2/ratio); c++) printf "#"; 
+                printf "\n";
+            } else printf "%-9s :\n", $1;
+        }'
+    fi
+    return 0
+}
+
+# vypis grafu hodnot drzanych pozicii podla tickeru
+# ratio je pomer, podla ktoreho sa urcuje velkost grafu pre aktualny ticker
+graph_pos () {
+    POSITIONS=$(pos)
+    if [ $WIDTH -eq 0 ]; then
+        RATIO=1000
+    else
+        MAX=$(echo "$POSITIONS" | awk -F ":" 'function abs(v) {return v < 0 ? -v : v} { if (abs($2) > max) { max=abs($2) } } END { printf "%.2f", max }') 
+
+        float_scale=10
+        RATIO=$(echo "scale=$float_scale; $MAX/$WIDTH" | bc)
+    fi
+
+    echo "$POSITIONS" | awk -F ":" -v ratio="$RATIO" '{ 
+        if ($2>=ratio && ratio != 0) {
+            printf "%-9s : ", $1;
+            for(c=0;c<(int($2/ratio));c++) printf "#"; 
+            printf "\n";
+        } else if ($2<=-ratio && ratio != 0) {
+            printf "%-9s : ", $1;
+            for(c=0;c>(int($2/ratio));c--) printf "!"; printf "\n"
+        } else printf "%-9s :\n", $1; 
+    }'
+    return 0
+}
+
+AFTER="0000-00-00 00:00:00"
+BEFORE="9999-13-32 24:00:00"
+TICKERS=" "
+WIDTH=0
+COMMAND=""
+FILTER=0
+GZIP_LOGS=""
+LOGS=""
+
+# citanie vstupnych argumentov
+while [ $# -gt 0 ] ; do
+    case $1 in
+        "-h"|"--help")
+            print_help
+            exit 0
+            ;;
+        # =========== prikazy ===========
+        "list-tick" | "profit" | "pos" | "last-price" | "hist-ord" | "graph-pos")
+            if [ -z $COMMAND ]; then
+                COMMAND="$1"
+            else
+                echo "tradelog: povoleny je len jeden prikaz"
+                exit 1
+            fi
+            shift
+            ;;
+        # =========== filtre ============
+        "-a")
+            AFTER=$(echo "$2" | awk -F ";" -v AFTER="$AFTER" '{ if ($1 > AFTER) print $1}')
+            shift 2
+            ;;
+        "-b")
+            BEFORE=$(echo "$2" | awk -F ";" -v BEFORE="$BEFORE" '{ if ($1 > AFTER) print $1}')
+            shift 2
+            ;;
+        "-t")
+            TICKERS="$2|$TICKERS"
+            FILTER=1
+            shift 2
+            ;;
+        "-w")
+            # -w moze byt pouzite iba raz
+            if [ "$WIDTH" -ne 0 ]; then
+                echo "tradelog: -w je povolene pouzit iba raz"
+                exit 1
+            fi
+            # width musi byt > 0
+            WIDTH=$([ "$2" -eq "$2" ] 2>/dev/null && echo "$2" || echo "0")
+            if [ "$WIDTH" -eq 0 ]; then
+                echo "tradelog: WIDTH musi byt kladne nenulove cislo"
+                exit 1
+            elif [ $2 -le 0 ]; then
+                echo "tradelog: WIDTH musi byt kladne nenulove cislo"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            if echo "$1" | grep -q ".gz$"; then
+                GZIP_LOGS="$GZIP_LOGS $1"
+            else
+                LOGS="$LOGS $1"
+            fi
+            shift
+            ;;
+    esac
+done 
+
+# priprava regularneho vyrazu na filtrovanie tickerov
+if [ $FILTER -eq 0 ]; then
+    TICKERS=".*"
+else
+    TICKERS="($TICKERS)"
+fi
+
+if test ! -t 0 && ([ -n "$GZIP_LOGS" ] || [ -n "$LOGS" ]); then
+	INPUT="$(cat | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+				$2 ~ ticks { if (NF == 7 && $1>aft && $1 <bef) {print} }' | awk -F, '{printf "%s\\n", $1}')$(read_input)"
+else
+	  INPUT=$(read_input)
+fi
+
+# vykonavanie prikazu
+case $COMMAND in
+    "list-tick")
+        list_tick 
+        ;;
+    "profit")
+        profit
+        ;;
+    "pos")
+        VALUES=$(pos | sort -t: -k2 -n -r)
+        # hladanie najdlhsieho cisla podla poctu znakov kvoli zarovnavaniu
+        MAX=$(echo "$VALUES" | awk -F ":" '{ if (length($2) > longest) { longest=length($2) } } END { print longest }')
+        echo "$VALUES" | awk -F ":" -v max="$MAX" '{ printf "%-9s : %*.2f\n", $1, max, $2 }'
+        ;;
+    "last-price")
+        last_price
+        ;;
+    "hist-ord")
+        hist_ord
+        ;;
+    "graph-pos")
+        graph_pos
+        ;;
+    *)
+        echo "$INPUT"
+        ;;
+esac
